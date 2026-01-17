@@ -1,8 +1,9 @@
 fastapi
-uvicorn[standard]
-boto3
+uvicorn
 pydantic
-aiohttp
 openai
+aiohttp
 tripo3d
+numpy
+
 python-multipart
