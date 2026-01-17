@@ -4,7 +4,10 @@ pydantic
 openai
 aiohttp
 tripo3d
+boto3
+botocore
 numpy==1.26.4
 
 python-multipart
+
 
