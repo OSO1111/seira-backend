@@ -1,268 +1,179 @@
-# main.py
 import os
 import uuid
-import json
 import time
 import asyncio
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
-# 외부 SDK들은 "서버 부팅"은 항상 성공해야 하므로
-# 여기서 import는 하되, 클라이언트 생성은 절대 전역에서 하지 않습니다.
-from openai import OpenAI
-from tripo3d import TripoClient
-
-
 # =========================
-# App & CORS
+# App
 # =========================
-app = FastAPI(title="SEIRA Backend", version="1.0.0")
+app = FastAPI(title="SEIRA Backend", version="0.1.0")
 
-# WeWeb에서 호출할 것이므로 CORS 허용 (일단 전체 허용, 운영에서는 도메인 제한 권장)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # TODO: 운영에서는 WeWeb 도메인으로 제한
+    allow_origins=["*"],   # 운영에서는 WeWeb 도메인만 넣는 것을 권장
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
 # =========================
-# Config
+# Models (API Contract)
 # =========================
-BASE_URL = os.getenv("BASE_URL", "").rstrip("/")  # Railway public domain을 넣으면 URL 생성이 깔끔합니다.
-DATA_DIR = os.getenv("DATA_DIR", "/tmp/seira")    # Railway에서도 /tmp는 사용 가능 (영구 저장 아님)
-os.makedirs(DATA_DIR, exist_ok=True)
+class GenerateOptions(BaseModel):
+    quality: str = Field(default="standard", description="draft|standard|high")
 
-# (선택) 작업 상태 메모리 저장: 간단한 PoC용
-# 운영에서는 Redis/DB 권장
-JOBS: Dict[str, Dict[str, Any]] = {}
-
-
-# =========================
-# Helpers: API clients
-# =========================
-def get_openai_client() -> OpenAI:
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set")
-    return OpenAI(api_key=api_key)
-
-def get_tripo_client() -> TripoClient:
-    api_key = os.getenv("TRIPO_API_KEY")
-    if not api_key:
-        raise HTTPException(status_code=500, detail="TRIPO_API_KEY is not set")
-    return TripoClient(api_key=api_key)
-
-
-# =========================
-# Models
-# =========================
 class Generate3DRequest(BaseModel):
-    prompt: str = Field(..., description="Text prompt for 3D generation")
-    # 필요하면 옵션 확장
-    # quality: Optional[str] = "standard"
+    user_text: str
+    options: Optional[GenerateOptions] = None
 
 class Generate3DResponse(BaseModel):
     job_id: str
     status: str
-    preview_glb_url: Optional[str] = None
-    stl_url: Optional[str] = None
+
+class JobResult(BaseModel):
+    preview_url: Optional[str] = None
     glb_url: Optional[str] = None
+    stl_url: Optional[str] = None
+
+class JobStatusResponse(BaseModel):
+    job_id: str
+    status: str
+    progress: int = 0
     message: Optional[str] = None
+    result: JobResult = Field(default_factory=JobResult)
+    created_at: str
+    updated_at: str
 
 
 # =========================
-# Health
+# In-memory Job Store
+# (운영에서는 Redis/DB로 교체 권장)
+# =========================
+JOBS: Dict[str, Dict[str, Any]] = {}
+JOBS_LOCK = asyncio.Lock()
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+async def job_set(job_id: str, **kwargs):
+    async with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            return
+        job.update(kwargs)
+        job["updated_at"] = now_iso()
+
+async def job_get(job_id: str) -> Optional[Dict[str, Any]]:
+    async with JOBS_LOCK:
+        return JOBS.get(job_id)
+
+async def job_create(job_id: str):
+    async with JOBS_LOCK:
+        JOBS[job_id] = {
+            "job_id": job_id,
+            "status": "queued",
+            "progress": 0,
+            "message": None,
+            "result": {"preview_url": None, "glb_url": None, "stl_url": None},
+            "created_at": now_iso(),
+            "updated_at": now_iso(),
+        }
+
+# =========================
+# Lazy clients (중요)
+# =========================
+def get_openai_api_key() -> str:
+    return os.environ.get("OPENAI_API_KEY", "").strip()
+
+def get_tripo_api_key() -> str:
+    # 사용 중인 키 이름이 TRIPO_API_KEY로 보입니다.
+    return os.environ.get("TRIPO_API_KEY", "").strip()
+
+# =========================
+# Background pipeline (Step 1/2는 "흐름" 완성이 목적)
+# Step 3에서 실제 Tripo/convert/S3 업로드로 교체
+# =========================
+async def pipeline_generate_3d(job_id: str, user_text: str, quality: str):
+    try:
+        await job_set(job_id, status="running", progress=5, message="Job started")
+
+        # 1) 키 확인 (없어도 서버는 살아있고, job만 failed 처리)
+        tripo_key = get_tripo_api_key()
+        openai_key = get_openai_api_key()
+
+        if not tripo_key:
+            await job_set(
+                job_id,
+                status="failed",
+                progress=0,
+                message="TRIPO_API_KEY is not set. Please set it in Railway Variables.",
+            )
+            return
+
+        if not openai_key:
+            # OpenAI를 꼭 쓰는 구조가 아니라면 경고만 하고 계속 진행해도 됩니다.
+            # 지금은 명확히 실패 처리(원하시면 warning으로 변경 가능)
+            await job_set(
+                job_id,
+                status="failed",
+                progress=0,
+                message="OPENAI_API_KEY is not set. Please set it in Railway Variables.",
+            )
+            return
+
+        # 2) (현재 단계) 실제 생성은 아직 붙이기 전이라 "모의 진행"만 합니다.
+        # Step 3에서 여기를 Tripo 호출 + convert + 업로드로 교체합니다.
+        await job_set(job_id, progress=25, message="Preparing generation request")
+        await asyncio.sleep(1.0)
+
+        await job_set(job_id, progress=55, message="Generating 3D (stub)")
+        await asyncio.sleep(1.5)
+
+        await job_set(job_id, progress=80, message="Post-processing (stub)")
+        await asyncio.sleep(1.0)
+
+        # 3) 결과 URL (Step 3에서 실제 URL로 채움)
+        # 지금은 done까지 가는 “프론트 플로우 확인”용
+        result = {
+            "preview_url": None,
+            "glb_url": None,
+            "stl_url": None,
+        }
+        await job_set(job_id, status="done", progress=100, message="Done (stub)", result=result)
+
+    except Exception as e:
+        await job_set(job_id, status="failed", progress=0, message=f"Unhandled error: {e}")
+
+
+# =========================
+# Routes
 # =========================
 @app.get("/health")
 def health():
     return {"ok": True}
 
-
-# =========================
-# Files serving
-# =========================
-@app.get("/files/{job_id}/{filename}")
-def get_file(job_id: str, filename: str):
-    # /tmp 기반 파일 제공 (PoC)
-    job_dir = os.path.join(DATA_DIR, job_id)
-    file_path = os.path.join(job_dir, filename)
-
-    if not os.path.isfile(file_path):
-        raise HTTPException(status_code=404, detail="File not found")
-
-    # content-type 자동 추정은 FileResponse가 해줍니다.
-    return FileResponse(file_path)
-
-
-def make_public_url(path: str) -> str:
-    """
-    path: "/files/...." 형태
-    BASE_URL이 있으면 절대 URL로 반환, 없으면 path만 반환
-    """
-    if BASE_URL:
-        return f"{BASE_URL}{path}"
-    return path
-
-
-# =========================
-# Core: Background job
-# =========================
-async def run_generate_3d_job(job_id: str, prompt: str):
-    """
-    1) Tripo로 3D 생성 (예: glb 획득)
-    2) 필요하면 convert.py로 stl 변환
-    3) 결과 파일을 /tmp/seira/{job_id}/ 아래에 저장
-    """
-    JOBS[job_id]["status"] = "running"
-    JOBS[job_id]["updated_at"] = time.time()
-
-    job_dir = os.path.join(DATA_DIR, job_id)
-    os.makedirs(job_dir, exist_ok=True)
-
-    try:
-        tripo = get_tripo_client()
-
-        # -----------------------
-        # (1) Tripo 3D generation
-        # -----------------------
-        # tripo3d 라이브러리의 실제 메서드명/리턴은 버전에 따라 차이가 있을 수 있습니다.
-        # 사용 중인 SDK 기준으로 아래 블록만 맞춰주시면 됩니다.
-        #
-        # 아래는 "형태"만 잡아둔 예시입니다.
-        #
-        # 결과적으로 glb_bytes 혹은 glb_url을 얻어서 파일로 저장하면 됩니다.
-
-        # 예시: SDK가 task 기반일 경우
-        # task = tripo.text_to_3d(prompt=prompt)
-        # task_id = task.task_id
-        # while True:
-        #     status = tripo.get_task(task_id)
-        #     if status.status in ("succeeded", "failed"):
-        #         break
-        #     await asyncio.sleep(2)
-        # if status.status == "failed":
-        #     raise RuntimeError(status.error or "Tripo generation failed")
-        # glb_url = status.output.glb
-
-        # -----
-        # 여기서는 사용자가 이미 tripo3d를 설치했고,
-        # "실제 실행"은 사용자의 SDK 메서드에 맞춰 수정해야 하므로,
-        # 우선은 실패하지 않도록 안내 에러를 넣어둡니다.
-        # -----
-        # 사용 중인 tripo3d 호출 코드가 이미 있다면 여기만 교체하세요.
-        raise RuntimeError(
-            "Tripo generation call is not wired yet. "
-            "Replace the Tripo SDK call block in run_generate_3d_job() with your working code."
-        )
-
-        # (가정) glb_url을 얻었다면:
-        # glb_path = os.path.join(job_dir, "model.glb")
-        # # 다운로드 로직 (aiohttp 등)
-        # await download_to_file(glb_url, glb_path)
-
-        # -----------------------
-        # (2) Convert GLB -> STL (optional)
-        # -----------------------
-        # convert.py가 있는 경우에만, 요청 시점에 import하여 변환합니다.
-        # (서버 부팅 단계에서 convert import 에러로 죽는 것 방지)
-        #
-        # stl_path = os.path.join(job_dir, "model.stl")
-        # try:
-        #     from convert import glb_to_stl_via_obj  # 또는 generate_final_stl 등
-        #     glb_to_stl_via_obj(glb_path, stl_path)
-        # except Exception as e:
-        #     # 변환 실패해도 glb 프리뷰는 제공 가능하므로, stl만 실패 처리
-        #     JOBS[job_id]["warnings"] = [f"STL convert failed: {str(e)}"]
-
-        # -----------------------
-        # (3) Mark done
-        # -----------------------
-        # JOBS[job_id]["status"] = "done"
-        # JOBS[job_id]["glb_filename"] = "model.glb"
-        # JOBS[job_id]["stl_filename"] = "model.stl" if os.path.exists(stl_path) else None
-
-    except HTTPException as he:
-        JOBS[job_id]["status"] = "failed"
-        JOBS[job_id]["error"] = he.detail
-    except Exception as e:
-        JOBS[job_id]["status"] = "failed"
-        JOBS[job_id]["error"] = str(e)
-    finally:
-        JOBS[job_id]["updated_at"] = time.time()
-
-
-# =========================
-# API: create job (async)
-# =========================
 @app.post("/v1/generate-3d", response_model=Generate3DResponse)
-async def generate_3d(req: Generate3DRequest, background_tasks: BackgroundTasks):
+async def generate_3d(req: Generate3DRequest):
     job_id = str(uuid.uuid4())
-    JOBS[job_id] = {
-        "job_id": job_id,
-        "status": "queued",
-        "prompt": req.prompt,
-        "created_at": time.time(),
-        "updated_at": time.time(),
-    }
+    quality = (req.options.quality if req.options else "standard")
 
-    # 백그라운드에서 실행
-    background_tasks.add_task(run_generate_3d_job, job_id, req.prompt)
+    await job_create(job_id)
 
-    return Generate3DResponse(
-        job_id=job_id,
-        status="queued",
-        message="Job queued"
-    )
+    # 백그라운드 실행
+    asyncio.create_task(pipeline_generate_3d(job_id=job_id, user_text=req.user_text, quality=quality))
 
+    return {"job_id": job_id, "status": "queued"}
 
-# =========================
-# API: job status
-# =========================
-@app.get("/v1/jobs/{job_id}", response_model=Generate3DResponse)
-def get_job(job_id: str):
-    job = JOBS.get(job_id)
+@app.get("/v1/jobs/{job_id}", response_model=JobStatusResponse)
+async def get_job(job_id: str):
+    job = await job_get(job_id)
     if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+        raise HTTPException(status_code=404, detail="job_id not found")
 
-    status = job["status"]
-
-    glb_url = None
-    stl_url = None
-    preview_glb_url = None
-
-    if status == "done":
-        # 파일 URL 구성
-        if job.get("glb_filename"):
-            glb_url = make_public_url(f"/files/{job_id}/{job['glb_filename']}")
-            preview_glb_url = glb_url  # 프리뷰는 glb를 그대로 사용
-        if job.get("stl_filename"):
-            stl_url = make_public_url(f"/files/{job_id}/{job['stl_filename']}")
-
-    return Generate3DResponse(
-        job_id=job_id,
-        status=status,
-        preview_glb_url=preview_glb_url,
-        glb_url=glb_url,
-        stl_url=stl_url,
-        message=job.get("error") or (job.get("warnings")[0] if job.get("warnings") else None)
-    )
-
-
-# =========================
-# (Optional) Simple root
-# =========================
-@app.get("/")
-def root():
-    return {
-        "service": "seira-backend",
-        "health": "/health",
-        "generate_3d": "/v1/generate-3d",
-        "job_status": "/v1/jobs/{job_id}",
-    }
+    return job
