@@ -4,6 +4,7 @@ pydantic
 openai
 aiohttp
 tripo3d
-numpy
+numpy==1.26.4
 
 python-multipart
+
