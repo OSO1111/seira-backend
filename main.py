@@ -140,8 +140,10 @@ async def pipeline_generate_3d(job_id: str, user_text: str, quality: str):
 
         # 3) 결과 URL (Step 3에서 실제 URL로 채움)
         # 지금은 done까지 가는 “프론트 플로우 확인”용
+        # 3) 결과 URL (Step 3에서 실제 URL로 채움)
+        # 지금은 done까지 가는 “프론트 플로우 확인”용 (임시 이미지)
         result = {
-            "preview_url": None,
+            "preview_url": f"https://picsum.photos/seed/{job_id}/512/512",
             "glb_url": None,
             "stl_url": None,
         }
@@ -176,4 +178,13 @@ async def get_job(job_id: str):
     if not job:
         raise HTTPException(status_code=404, detail="job_id not found")
 
-    return job
+    # dict -> Pydantic model (result 중첩 포함)로 안전 변환
+    return JobStatusResponse(
+        job_id=job["job_id"],
+        status=job["status"],
+        progress=job.get("progress", 0),
+        message=job.get("message"),
+        result=JobResult(**(job.get("result") or {})),
+        created_at=job["created_at"],
+        updated_at=job["updated_at"],
+    )
