@@ -1,20 +1,23 @@
 import os
 import uuid
 import time
-import base64
+import shutil
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import httpx
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+
+from convert import convert_model
 
 # ============================================================
 # App
 # ============================================================
-app = FastAPI(title="SEIRA Backend", version="1.0.0")
+app = FastAPI(title="SEIRA Backend", version="2.0.0")
 
-# CORS (WeWeb/프론트에서 직접 호출 or 프록시 호출 모두 대비)
-# 배포 단계에서는 allow_origins를 WeWeb 도메인으로 좁히는 걸 권장합니다.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -24,9 +27,18 @@ app.add_middleware(
 )
 
 # ============================================================
-# In-memory Job Store (간단 MVP용)
-#  - Railway 재시작/스케일링 시 날아갑니다.
-#  - 운영 단계에서는 Redis/DB로 옮기시는 걸 권장합니다.
+# Output directory
+# ============================================================
+OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "generated"))
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+TMP_DIR = OUTPUT_DIR / "tmp"
+TMP_DIR.mkdir(parents=True, exist_ok=True)
+
+app.mount("/files", StaticFiles(directory=str(OUTPUT_DIR)), name="files")
+
+# ============================================================
+# In-memory Job Store (MVP용)
 # ============================================================
 JOBS: Dict[str, Dict[str, Any]] = {}
 
@@ -64,14 +76,20 @@ def _set_job(job_id: str, **kwargs) -> None:
     job["updated_at"] = _now_ts()
 
 
+def _public_file_url(filename: str) -> str:
+    public_base = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
+    if public_base:
+        return f"{public_base}/files/{filename}"
+    return f"/files/{filename}"
+
+
 # ============================================================
 # Models
 # ============================================================
 class GenerateImagesRequest(BaseModel):
     prompt: str = Field(..., min_length=1)
     n: int = Field(4, ge=1, le=8)
-    size: str = Field("1024x1024")  # OpenAI Images 기준
-    # 필요 시 style/seed 등 확장 가능
+    size: str = Field("1024x1024")
 
 
 class GenerateImagesResponse(BaseModel):
@@ -80,11 +98,10 @@ class GenerateImagesResponse(BaseModel):
 
 
 class Generate3DRequest(BaseModel):
-    # 사용자가 선택한 이미지(보통 URL) 1장을 넣는 형태를 권장
+    prompt: Optional[str] = None
     image_url: Optional[str] = None
-    image_b64: Optional[str] = None  # base64 raw (dataURL 말고 "AAAA..." 형태 권장)
-    # 3D 파이프라인 옵션 (필요 시 확장)
-    output_format: str = Field("glb")  # glb/stl 등
+    image_b64: Optional[str] = None
+    output_format: str = Field("glb")  # glb / stl / obj / fbx
     label: Optional[str] = None
 
 
@@ -102,22 +119,12 @@ class JobStatusResponse(BaseModel):
 
 
 # ============================================================
-# OpenAI Image Generation (가장 단순한 형태)
-#  - 아래는 "실제로 동작하는 구현"을 위해 HTTP 호출로 작성했습니다.
-#  - OPENAI_API_KEY 반드시 Railway 환경변수로 넣으셔야 합니다.
+# OpenAI Image Generation
 # ============================================================
 def _openai_generate_images(prompt: str, n: int, size: str) -> List[str]:
-    """
-    Returns: list of image URLs (문자열)
-    """
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY is not set")
-
-    # OpenAI Images API (Responses API가 아니라 Images API로 단순 처리)
-    # - 모델은 환경변수로 바꿀 수 있게 처리
-    # - 참고: 모델/엔드포인트는 향후 변경될 수 있으니 운영 시 최신 문서 기준으로 업데이트 권장
-    import httpx
 
     model = os.environ.get("OPENAI_IMAGE_MODEL", "gpt-image-1")
 
@@ -140,13 +147,12 @@ def _openai_generate_images(prompt: str, n: int, size: str) -> List[str]:
         raise RuntimeError(f"OpenAI image generation failed: {r.status_code} {r.text}")
 
     data = r.json()
-    # 일반적으로 data["data"] 안에 url 또는 b64_json이 옵니다.
     urls: List[str] = []
+
     for item in data.get("data", []):
         if "url" in item and item["url"]:
             urls.append(item["url"])
         elif "b64_json" in item and item["b64_json"]:
-            # WeWeb에 바로 보여주려면 data URL로 변환
             b64 = item["b64_json"]
             urls.append(f"data:image/png;base64,{b64}")
 
@@ -154,6 +160,164 @@ def _openai_generate_images(prompt: str, n: int, size: str) -> List[str]:
         raise RuntimeError("OpenAI returned no images")
 
     return urls
+
+
+# ============================================================
+# Tripo3D helpers
+# ============================================================
+TRIPO_BASE_URL = os.environ.get("TRIPO_BASE_URL", "https://api.tripo3d.ai/v2/openapi")
+TRIPO_TIMEOUT = float(os.environ.get("TRIPO_TIMEOUT", "60"))
+TRIPO_POLL_INTERVAL = float(os.environ.get("TRIPO_POLL_INTERVAL", "5"))
+TRIPO_MAX_POLLS = int(os.environ.get("TRIPO_MAX_POLLS", "60"))
+
+
+def _get_tripo_headers() -> Dict[str, str]:
+    api_key = os.environ.get("TRIPO_API_KEY")
+    if not api_key:
+        raise RuntimeError("TRIPO_API_KEY is not set")
+
+    return {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+
+def _download_file(url: str, dest_path: Path) -> None:
+    with httpx.Client(timeout=180, follow_redirects=True) as client:
+        with client.stream("GET", url) as response:
+            response.raise_for_status()
+            with open(dest_path, "wb") as f:
+                for chunk in response.iter_bytes():
+                    f.write(chunk)
+
+
+def _create_tripo_text_task(prompt: str) -> str:
+    headers = _get_tripo_headers()
+    url = f"{TRIPO_BASE_URL}/task"
+
+    payload = {
+        "type": "text_to_model",
+        "prompt": prompt,
+    }
+
+    print("[TRIPO] CREATE URL:", url)
+    print("[TRIPO] CREATE BODY:", payload)
+
+    with httpx.Client(timeout=TRIPO_TIMEOUT) as client:
+        response = client.post(url, headers=headers, json=payload)
+
+    print("[TRIPO] CREATE STATUS:", response.status_code)
+    print("[TRIPO] CREATE RESPONSE:", response.text)
+
+    response.raise_for_status()
+    data = response.json()
+
+    task_id = data.get("data", {}).get("task_id") or data.get("task_id")
+    if not task_id:
+        raise RuntimeError(f"Tripo create task: task_id not found in response: {data}")
+
+    return task_id
+
+
+def _create_tripo_image_task(
+    image_url: Optional[str],
+    image_b64: Optional[str],
+    label: Optional[str],
+) -> str:
+    headers = _get_tripo_headers()
+    url = f"{TRIPO_BASE_URL}/task"
+
+    payload: Dict[str, Any] = {
+        "type": "image_to_model",
+    }
+
+    if image_url:
+        payload["file"] = {"type": "url", "url": image_url}
+    elif image_b64:
+        payload["file"] = {"type": "base64", "data": image_b64}
+    else:
+        raise RuntimeError("image_url or image_b64 is required")
+
+    if label:
+        payload["name"] = label
+
+    print("[TRIPO] CREATE URL:", url)
+    print("[TRIPO] CREATE BODY:", payload)
+
+    with httpx.Client(timeout=TRIPO_TIMEOUT) as client:
+        response = client.post(url, headers=headers, json=payload)
+
+    print("[TRIPO] CREATE STATUS:", response.status_code)
+    print("[TRIPO] CREATE RESPONSE:", response.text)
+
+    response.raise_for_status()
+    data = response.json()
+
+    task_id = data.get("data", {}).get("task_id") or data.get("task_id")
+    if not task_id:
+        raise RuntimeError(f"Tripo create task: task_id not found in response: {data}")
+
+    return task_id
+
+
+def _get_tripo_task(task_id: str) -> Dict[str, Any]:
+    headers = _get_tripo_headers()
+    url = f"{TRIPO_BASE_URL}/task/{task_id}"
+
+    with httpx.Client(timeout=TRIPO_TIMEOUT) as client:
+        response = client.get(url, headers=headers)
+
+    print("[TRIPO] POLL URL:", url)
+    print("[TRIPO] POLL STATUS:", response.status_code)
+    print("[TRIPO] POLL RESPONSE:", response.text)
+
+    response.raise_for_status()
+    return response.json()
+
+
+def _extract_model_url(task_data: Dict[str, Any]) -> Optional[str]:
+    root = task_data.get("data", task_data)
+
+    candidates = [
+        root.get("output", {}).get("model_url"),
+        root.get("output", {}).get("glb_url"),
+        root.get("model_url"),
+        root.get("glb_url"),
+        root.get("result", {}).get("model_url"),
+        root.get("result", {}).get("glb_url"),
+    ]
+
+    for c in candidates:
+        if c:
+            return c
+
+    return None
+
+
+def _wait_for_tripo_result(task_id: str) -> str:
+    for _ in range(TRIPO_MAX_POLLS):
+        task_data = _get_tripo_task(task_id)
+        root = task_data.get("data", task_data)
+
+        status = (
+            root.get("status")
+            or root.get("task_status")
+            or root.get("state")
+            or ""
+        ).lower()
+
+        if status in {"success", "completed", "done"}:
+            model_url = _extract_model_url(task_data)
+            if not model_url:
+                raise RuntimeError(f"Tripo task completed but no model URL found: {task_data}")
+            return model_url
+
+        if status in {"failed", "error"}:
+            raise RuntimeError(f"Tripo task failed: {task_data}")
+
+        time.sleep(TRIPO_POLL_INTERVAL)
+
+    raise RuntimeError("Tripo task polling timed out")
 
 
 # ============================================================
@@ -178,7 +342,7 @@ def worker_generate_images(job_id: str) -> None:
             job_id,
             status=JOB_STATUS_COMPLETED,
             result={
-                "images": urls,  # ✅ WeWeb에서 이 배열을 그대로 반복 렌더링하면 됩니다.
+                "images": urls,
                 "count": len(urls),
             },
         )
@@ -191,43 +355,69 @@ def worker_generate_images(job_id: str) -> None:
 
 
 def worker_generate_3d(job_id: str) -> None:
-    """
-    여기서는 3D 생성 파이프라인이 실제로 어디에 있느냐(Tripo/자체 Blender/등)에 따라 달라집니다.
-    일단 "구조"만 잡고, 실제 생성은 나중에 붙이실 수 있도록 fail-safe 형태로 둡니다.
-    """
     job = JOBS.get(job_id)
     if not job:
         return
+
+    temp_dir = TMP_DIR / job_id
+    temp_dir.mkdir(parents=True, exist_ok=True)
 
     try:
         _set_job(job_id, status=JOB_STATUS_PROCESSING)
 
         payload = job["payload"]
+        prompt = payload.get("prompt")
         image_url = payload.get("image_url")
         image_b64 = payload.get("image_b64")
-        output_format = payload.get("output_format", "glb")
+        output_format = (payload.get("output_format") or "glb").lower()
+        label = payload.get("label")
 
-        if not image_url and not image_b64:
-            raise RuntimeError("image_url or image_b64 is required")
+        if not prompt and not image_url and not image_b64:
+            raise RuntimeError("prompt or image_url or image_b64 is required")
 
-        # TODO: 실제 3D 생성 로직 연결
-        # 예: 외부 API 호출 → 결과 파일을 R2 업로드 → public URL 반환
-        # 여기서는 데모로 "가짜 결과"를 반환합니다.
-        # 운영 시 이 부분만 교체하시면 됩니다.
+        # 1) Tripo task 생성
+        if prompt:
+            tripo_task_id = _create_tripo_text_task(prompt)
+        else:
+            tripo_task_id = _create_tripo_image_task(image_url, image_b64, label)
 
-        fake_url = f"https://example.com/output/{job_id}.{output_format}"
+        # 2) polling해서 최종 GLB URL 받기
+        glb_url = _wait_for_tripo_result(tripo_task_id)
 
+        # 3) GLB 다운로드
+        input_glb_path = temp_dir / f"{job_id}.glb"
+        _download_file(glb_url, input_glb_path)
+
+        # 4) 원하는 형식으로 변환
+        final_filename = f"{job_id}.{output_format}"
+        final_path = OUTPUT_DIR / final_filename
+
+        convert_model(
+            input_path=str(input_glb_path),
+            output_path=str(final_path),
+            output_format=output_format,
+        )
+
+        # 5) 결과 저장
         _set_job(
             job_id,
             status=JOB_STATUS_COMPLETED,
             result={
-                "model_url": fake_url,
+                "model_url": _public_file_url(final_filename),
+                "source_glb_url": glb_url,
                 "format": output_format,
+                "tripo_task_id": tripo_task_id,
             },
         )
 
     except Exception as e:
-        _set_job(job_id, status=JOB_STATUS_FAILED, error={"message": str(e)})
+        _set_job(
+            job_id,
+            status=JOB_STATUS_FAILED,
+            error={"message": str(e)},
+        )
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 # ============================================================
@@ -238,7 +428,6 @@ def health():
     return {"ok": True}
 
 
-# 1) 텍스트 -> 이미지 4장 생성 (Job 생성)
 @app.post("/v1/generate-images", response_model=GenerateImagesResponse)
 def generate_images(req: GenerateImagesRequest, bg: BackgroundTasks):
     job = _new_job(
@@ -253,14 +442,12 @@ def generate_images(req: GenerateImagesRequest, bg: BackgroundTasks):
     return {"job_id": job["job_id"], "status": job["status"]}
 
 
-# 2) Job Status 조회 (✅ 여기서 반드시 status를 내려줌)
 @app.get("/v1/jobs/{job_id}", response_model=JobStatusResponse)
 def get_job(job_id: str):
     job = JOBS.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="job_id not found")
 
-    # ✅ WeWeb에서 필요로 하는 핵심: status / result(images or model_url)
     return {
         "job_id": job["job_id"],
         "status": job["status"],
@@ -270,12 +457,12 @@ def get_job(job_id: str):
     }
 
 
-# 3) 선택한 이미지 1장 -> 3D 생성 (Job 생성)
 @app.post("/v1/generate-3d", response_model=Generate3DResponse)
 def generate_3d(req: Generate3DRequest, bg: BackgroundTasks):
     job = _new_job(
         job_type="generate_3d",
         payload={
+            "prompt": req.prompt,
             "image_url": req.image_url,
             "image_b64": req.image_b64,
             "output_format": req.output_format,
