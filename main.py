@@ -162,6 +162,11 @@ class Generate3DResponse(BaseModel):
     status: str
 
 
+class RepairMeshUrlRequest(BaseModel):
+    file_url: str
+    original_filename: Optional[str] = "input.glb"
+    
+
 class RepairMeshResponse(BaseModel):
     job_id: str
     status: str
@@ -667,41 +672,24 @@ def get_job(job_id: str):
     }
 
 
-@app.post("/v1/generate-3d", response_model=Generate3DResponse)
-def generate_3d(req: Generate3DRequest, bg: BackgroundTasks):
-    job = _new_job(
-        job_type="generate_3d",
-        payload={
-            "prompt": req.prompt,
-            "image_url": req.image_url,
-            "image_b64": req.image_b64,
-            "output_format": req.output_format,
-            "label": req.label,
-        },
-    )
-    bg.add_task(worker_generate_3d, job["job_id"])
-    return {"job_id": job["job_id"], "status": job["status"]}
+@app.post("/v1/repair-mesh-url", response_model=RepairMeshResponse)
+def repair_mesh_url(req: RepairMeshUrlRequest, bg: BackgroundTasks):
+    if not req.file_url:
+        raise HTTPException(status_code=400, detail="file_url is required")
 
-
-@app.post("/v1/repair-mesh", response_model=RepairMeshResponse)
-async def repair_mesh(bg: BackgroundTasks, file: UploadFile = File(...)):
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="filename is required")
-
-    ext = Path(file.filename).suffix.lower()
+    ext = Path(req.original_filename).suffix.lower() or ".glb"
     allowed_exts = {".glb", ".stl", ".obj", ".ply", ".off"}
     if ext not in allowed_exts:
-        raise HTTPException(
-            status_code=400,
-            detail=f"unsupported file type: {ext}. allowed={sorted(allowed_exts)}",
-        )
+        ext = ".glb"
 
-    safe_name = _safe_filename(file.filename)
+    safe_name = _safe_filename(req.original_filename or f"input{ext}")
     saved_name = f"{uuid.uuid4()}_{safe_name}"
     saved_path = UPLOAD_DIR / saved_name
 
-    with open(saved_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+    try:
+        _download_file(req.file_url, saved_path)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"failed to download file_url: {str(e)}")
 
     job = _new_job(
         job_type="repair_mesh",
